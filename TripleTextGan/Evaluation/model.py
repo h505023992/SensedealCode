@@ -71,55 +71,50 @@ class Generator(FlyModel):
 
 
     def forward(self, batch,rl_mode=True):
-        # # batch["source_mask"] = batch["source_token_ids"] != self.tokenizer.pad_token_id
-        # batch["target_mask"] = batch["target_token_ids"] != self.tokenizer.pad_token_id
-        # # batch["source_position_ids"] = batch["source_mask"].cumsum(-1) - 1
-        # batch["target_position_ids"] = batch["target_mask"].cumsum(-1) - 1
+        #输入的句子都是pad好的
         batch_size = len(batch["target_token_ids"])
         device = batch["target_token_ids"].device
-
         past_mask = torch.ones(batch_size, 1).bool().to(device)
         batch["target_mask"] = batch["target_token_ids"] != self.tokenizer.pad_token_id
         batch["target_position_ids"] = batch["target_mask"].cumsum(-1)
         joint_mask = torch.cat((past_mask, batch["target_mask"]), dim=1)
-
-        # (12,2, batch_size, num_head, sql_len+1, head_features)
-        # past = torch.randn(size=(12, 2, batch_size, 12, 1, 61)).to(device)  # 64-3
-        # temp = batch["source_token_ids"].unsqueeze(1).unsqueeze(2).unsqueeze(0).unsqueeze(0)
-        # classification = torch.tile(temp, (12, 2, 1, 12, 1, 1))
-        # past = torch.cat((classification, past), dim=-1)
-
         logits, _ = self.decoder(
             input_ids=batch["target_token_ids"],
             position_ids=batch['target_position_ids'],
             attention_mask=joint_mask,
             past=batch["past"]
         )
-
         if not rl_mode:
             loss = self.compute_lm_loss(batch["target_token_ids"], logits, batch["target_mask"])
 
             return {"loss": loss}
         else:
-            logits = logits[:, :-1].contiguous() #最后一个结束词的概率不要
+            logits = logits[:, :-1].contiguous() #输入一个单词输出一个概率，输入完整句子后，输出句子+1的那个单词的概率没有target
             target_token_ids = batch["target_token_ids"][:, 1:].contiguous() # target_token_ids在生成器训练的时候是action，因为要求新老概率
             log_probs = torch.log_softmax(logits, dim=-1)
-            # #计算熵正则
-            # masks = batch["target_mask"][:, 2:].unsqueeze(-1)  # B*(S-1) 多加最后一维便于广播机制
-            # log_probs_mask = log_probs * masks # B S-1 V
-            # probs_mask = log_probs_mask.exp() # B  S-1 V
-            # entropy_loss = -(log_probs_mask * probs_mask).sum(-1).sum(-1).mean()  # 梯度下降让负的信息熵越小，正的信息熵越大
             #只计算target的概率
             log_probs = torch.gather(log_probs,# B S
                                     dim=-1,
                                     index=target_token_ids.unsqueeze(-1)).squeeze(-1)
+
             # mask
-            log_probs = (log_probs * batch["target_mask"][:, 1:]).sum(-1) # / mask.sum(-1) #与
-
-
-
+            log_probs = ( log_probs  * batch["target_mask"][:, 1:]).sum(-1) # / mask.sum(-1) #与
             results = {"log_probs": log_probs, "loss": 0.0}
             return results
+            #仅有改动：注释了sum(-1)
+            # probs = torch.softmax(logits, dim=-1)
+            # #只计算target的概率
+            # probs = torch.gather(probs,# B S
+            #                         dim=-1,
+            #                         index=target_token_ids.unsqueeze(-1)).squeeze(-1)
+            # GAMMA = torch.tensor(0.99)
+            # for i in range(probs.shape[-1],0,-1):
+            #     probs[:,i-1] = probs[:,i-1]*torch.log(GAMMA)
+            #     GAMMA*=GAMMA
+            # # mask
+            # log_probs = (probs * batch["target_mask"][:, 1:]).sum(-1) # / mask.sum(-1) #与
+            # results = {"log_probs": log_probs, "loss": 0.0}
+            # return results
 
     def predict(self, batch):
         results = self.forward(batch)
@@ -147,7 +142,7 @@ class Discriminator(FlyModel):
         self.active_l1 = F.relu
         self.l2 = nn.Linear(256, 1)
         self.active_l2 = torch.sigmoid
-
+        self.l_ot=nn.Linear(256,256)
         # for param in self.model.parameters():
         #     param.requires_grad = True
 
@@ -156,19 +151,50 @@ class Discriminator(FlyModel):
         x = torch.cat([out,label],dim=-1)
         return self.active_l2(self.l2(self.active_l1(self.l1(x))))
 
-    def forward(self, batch):
-        prob_ref = self.cal(batch["reference"],batch['label'])
-        prob_can = self.cal(batch["candidate"],batch['label'])
-        ref_loss = torch.log(prob_ref).mean()
-        prob_can_loss = torch.log(prob_can).mean()
-        loss = -(ref_loss-prob_can_loss)#最大化ref的概率，最小化can的概率，然后取负
-        #loss.backward() #报错说明问题出在这
-        # loss.requires_grad_(True)
-        return {"reward": prob_can.detach().cpu().numpy(), "loss": loss,"ref_prob":prob_ref}
+    def cal2(self, input, label):
+        out = self.model(input)[1]
+        x = torch.cat([out, label], dim=-1)
+        return self.l_ot(self.active_l1(self.l1(x)))
+    def cal_ot(self,batch):
+        ref_feature = self.cal2(batch["reference"],batch['label'])
+        candidate_feature = self.cal2(batch["candidate"],batch['label'])
+        C = 1 - torch.cosine_similarity(ref_feature.unsqueeze(0), candidate_feature.unsqueeze(1),
+                                        dim=2)  # 1的时候每一行是candi，0的时候每一列是ref
+        device = C.device
+        with torch.no_grad():
+            G = C  # ...不然没梯度，我傻了
+            candidate_prob = torch.tensor([1. / len(candidate_feature)] * len(candidate_feature)).to(device)
+            ref_prob = torch.tensor([1. / len(ref_feature)] * len(ref_feature)).to(device)
+            max_iter = 10
+            reg = 0.1
+            numItermax = 1000
+            for i in range(max_iter):
+                T = ot.bregman.sinkhorn_log(candidate_prob, ref_prob, G, reg, numItermax)
+                G = G - reg * torch.log(T)
+        loss = -(T * C).sum()
+        mean_r = ((T * C).sum(dim=1)).mean()
+        ratio = ((T * C).sum() / mean_r)
+        return {"reward": (-(T * C).sum(dim=1) * ratio).detach().cpu().numpy(), "loss": loss,"ref_prob":[0]}
+    def forward(self, batch,weights):
+        if  not self.config.text_gail.ot:
+            prob_ref = self.cal(batch["reference"],batch['label'])
+            prob_can = self.cal(batch["candidate"],batch['label'])
+            prob_can_loss = torch.log(prob_can).mean()
+            if weights is not None:
+                ref_loss = (torch.log(prob_ref)*weights).mean()
+                loss = -(2*ref_loss - prob_can_loss)
+            else:
+                ref_loss = torch.log(prob_ref).mean()
+                loss = -(ref_loss-prob_can_loss)#最大化ref的概率，最小化can的概率，然后取负
+            #loss.backward() #报错说明问题出在这
+            # loss.requires_grad_(True)
 
+            return {"reward": prob_can.detach().cpu().numpy(), "loss": loss,"ref_prob":prob_ref}
+        else:
+            return self.cal_ot(batch)
     def get_reward(self, candidate,label):
         prob_can = self.cal(candidate,label)
-        return prob_can
+        return prob_can.detach()
     def classify_adv(self,expert,classify_label):
         prob_classify = self.cal(expert, classify_label)
         loss = torch.log(prob_classify).mean() #鉴别器要尽可能对这个东西判别为0，所以对这个值进行梯度下降

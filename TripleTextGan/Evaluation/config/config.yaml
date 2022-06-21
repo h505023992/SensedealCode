@@ -1,0 +1,13 @@
+task:
+    name: COCO # COCO EMNLP_NEWS
+hydra:
+    run: # specify the working directory
+      dir: ./outputs/${task.name} # ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S} #./outputs/exp1 #
+defaults:
+    - task: ${task.name}
+    - training: ${task.name}
+    - text_gail: ${task.name}
+    - model: roberta-tokenized-gpt2
+    - decode: default
+
+# COCO, EMNLP_NEWS

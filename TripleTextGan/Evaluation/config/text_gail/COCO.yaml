@@ -1,0 +1,20 @@
+text_gail:
+    batch_size: None # it should be set in the training batch size
+    ppo_buffer_size: 32 # 128  #每个step的数据样本量，会进行(ppo_b_s/b_s)次采样
+    sample_batch_size: 64 # 32  好了，这个东西被我改的不用了，只需要关注ppo_buffer_size跟batch_size就可以了||鉴别器用来计算奖励的batch，以及在这个过程生成器生成句子的batch
+    ppo_mini_batch_size: 8 # PPO用来更新生成器参数的batch
+    ppo_epoch: 1
+    ppo_epsilon: 0.1
+    mix_human_demo_init_ratio: 0 #0.3
+    mix_human_demo_ratio_warmup_steps: 100 #
+    # Pre-train discriminator first
+    discriminator_pretrain_steps: 40 #initial 100
+    # whehter a human demostration's reward is determined by the reward function
+    constant_human_demo_reward: True #True
+    # due to precision problems when autoregressive generating
+    # it might need to recompute log_probs
+    recompute_log_probs: True
+    # entropy regularzation to prevent from over-fitting
+    entropy_reg_number: 0.001
+    MLE_alpha: 10
+    MLE_size: 8

@@ -1,0 +1,15 @@
+task:
+    name: COCO # COCO, EMNLP_NEWS
+defaults:
+    - task: ${task.name} #${task.name}
+    - training: ${task.name} #${task.name}
+    - model: roberta-tokenized-gpt2
+    - decode: default
+flyconfig:
+    run:
+        # Specify the working directory
+        # ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+        dir: ./outputs #/${task.name}/bishe #${task.name}
+
+
+
